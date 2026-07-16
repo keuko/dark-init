@@ -147,17 +147,20 @@ PATH_SNIPPET_END="# <<< dark-init PATH <<<"
 
 add_path_snippet() {
     target_file="$1"
+    tmp_file="${target_file}.dark-init.tmp"
 
     if [ ! -f "${target_file}" ]; then
         : > "${target_file}"
     fi
 
-    if grep -Fq "${PATH_SNIPPET_START}" "${target_file}"; then
-        say "$OK" "PATH already configured in ${target_file}"
-        return 0
-    fi
+    awk -v start="${PATH_SNIPPET_START}" -v end="${PATH_SNIPPET_END}" '
+        $0 == start { skip=1; next }
+        $0 == end   { skip=0; next }
+        !skip       { print }
+    ' "${target_file}" > "${tmp_file}"
 
     {
+        cat "${tmp_file}"
         printf '\n%s\n' "${PATH_SNIPPET_START}"
         printf 'if [ -d "%s" ]; then\n' "${BIN_DIR}"
         printf '    case ":$PATH:" in\n'
@@ -172,9 +175,10 @@ add_path_snippet() {
         printf '    esac\n'
         printf 'fi\n'
         printf '%s\n' "${PATH_SNIPPET_END}"
-    } >> "${target_file}"
+    } > "${target_file}"
 
-    say "$OK" "Added PATH snippet to ${target_file}"
+    rm -f "${tmp_file}"
+    say "$OK" "Updated PATH snippet in ${target_file}"
 }
 
 add_path_snippet "${BASHRC}"
