@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+DATA_DIR="${DARK_INIT_DATA_DIR:-${HOME}/.local/share/dark-init}"
+BIN_DIR="${DATA_DIR}/bin"
+VENV_DIR="${DATA_DIR}/venv"
+USER_BIN_DIR="${DARK_INIT_USER_BIN_DIR:-${HOME}/.local/bin}"
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/dark-init"
+CHECK_FILE="${CACHE_DIR}/last-update-check"
+MANIFEST_FILE="${DATA_DIR}/installed-commands"
+BASHRC="${HOME}/.bashrc"
+UPDATE_INTERVAL="${DARK_INIT_UPDATE_INTERVAL:-3600}"
+
+ok() { printf '[✓] %s\n' "$*"; }
+info() { printf '[*] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+die() { printf '[✗] %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'USAGE_EOF'
+Usage: dark-init <command> [options]
+
+Commands:
+  install             Install or refresh dark-init and all scripts
+  list, ls            List available scripts and installation status
+  status              Show installation and repository status
+  update              Check Git remote and update only when needed
+  help                 Show this help
+
+Update options:
+  --quiet              Suppress normal output
+  --force              Ignore the update-check interval
+
+Environment:
+  DARK_INIT_UPDATE_INTERVAL  Seconds between remote checks (default: 3600)
+  DARK_INIT_DATA_DIR         Runtime data directory
+  DARK_INIT_USER_BIN_DIR     Directory containing the dark-init command
+USAGE_EOF
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+remove_managed_block() {
+    local file="$1" start="$2" end="$3" tmp
+    [ -f "$file" ] || : > "$file"
+    tmp="$(mktemp "${file}.dark-init.XXXXXX")"
+    awk -v start="$start" -v end="$end" '
+        $0 == start { skip=1; next }
+        $0 == end { skip=0; next }
+        !skip { print }
+    ' "$file" > "$tmp"
+    mv "$tmp" "$file"
+}
+
+configure_bashrc() {
+    local start='# >>> dark-init >>>'
+    local end='# <<< dark-init <<<'
+    remove_managed_block "$BASHRC" "$start" "$end"
+    cat >> "$BASHRC" <<BASHRC_EOF
+
+${start}
+# Commands installed by dark-init.
+if [ -d "${BIN_DIR}" ]; then
+    case ":\${PATH}:" in
+        *:"${BIN_DIR}":*) ;;
+        *) export PATH="${BIN_DIR}:\${PATH}" ;;
+    esac
+fi
+
+# Check at most once per configured interval; reinstall only after a new commit.
+if command -v dark-init >/dev/null 2>&1; then
+    dark-init update --quiet >/dev/null 2>&1 || true
+fi
+${end}
+BASHRC_EOF
+    ok "Updated ${BASHRC}"
+}
+
+install_cli() {
+    mkdir -p "$USER_BIN_DIR"
+    ln -sfn "$REPO_DIR/dark-init" "$USER_BIN_DIR/dark-init"
+    ok "Installed command: ${USER_BIN_DIR}/dark-init"
+}
+
+install_requirements() {
+    require_command python3
+    if [ ! -x "$VENV_DIR/bin/python3" ]; then
+        info "Creating Python virtual environment"
+        python3 -m venv "$VENV_DIR"
+    fi
+    if [ "${DARK_INIT_SKIP_REQUIREMENTS:-0}" = "1" ]; then
+        info "Skipping Python requirements"
+    elif [ -f "$REPO_DIR/requirements.txt" ]; then
+        info "Installing Python requirements"
+        "$VENV_DIR/bin/python3" -m pip install -r "$REPO_DIR/requirements.txt"
+    fi
+}
+
+install_wrappers() {
+    local scripts_dir="$REPO_DIR/scripts"
+    local new_manifest="${MANIFEST_FILE}.new"
+    local file filename command interpreter old_command
+    mkdir -p "$BIN_DIR" "$DATA_DIR"
+    : > "$new_manifest"
+    [ -d "$scripts_dir" ] || die "Scripts directory not found: $scripts_dir"
+
+    for file in "$scripts_dir"/*; do
+        [ -f "$file" ] || continue
+        filename="$(basename "$file")"
+        case "$filename" in
+            *.py) command="${filename%.py}"; interpreter="$VENV_DIR/bin/python3" ;;
+            *.sh) command="${filename%.sh}"; interpreter="/usr/bin/env bash" ;;
+            *) continue ;;
+        esac
+        grep -Fxq "$command" "$new_manifest" 2>/dev/null && die "Duplicate command name: $command"
+        printf '#!/usr/bin/env bash\nexec %s %q "$@"\n' "$interpreter" "$file" > "$BIN_DIR/$command"
+        chmod 0755 "$BIN_DIR/$command"
+        printf '%s\n' "$command" >> "$new_manifest"
+        ok "Installed script: $command"
+    done
+
+    if [ -f "$MANIFEST_FILE" ]; then
+        while IFS= read -r old_command; do
+            [ -n "$old_command" ] || continue
+            if ! grep -Fxq "$old_command" "$new_manifest"; then
+                rm -f "$BIN_DIR/$old_command"
+                ok "Removed stale script: $old_command"
+            fi
+        done < "$MANIFEST_FILE"
+    fi
+    mv "$new_manifest" "$MANIFEST_FILE"
+}
+
+cmd_install() {
+    install_cli
+    install_requirements
+    install_wrappers
+    configure_bashrc
+    printf '\n'
+    ok "dark-init installation completed"
+    info "Repository: $REPO_DIR"
+    info "Reload the shell with: source ~/.bashrc"
+}
+
+script_type() {
+    case "$1" in *.py) printf 'Python' ;; *.sh) printf 'Shell' ;; *) printf 'Unknown' ;; esac
+}
+
+cmd_list() {
+    local file filename command status
+    printf '%-25s %-10s %-12s %s\n' 'COMMAND' 'TYPE' 'STATUS' 'SOURCE'
+    printf '%-25s %-10s %-12s %s\n' '------------------------' '---------' '-----------' '------'
+    for file in "$REPO_DIR/scripts"/*; do
+        [ -f "$file" ] || continue
+        filename="$(basename "$file")"
+        case "$filename" in *.py) command="${filename%.py}" ;; *.sh) command="${filename%.sh}" ;; *) continue ;; esac
+        if [ -x "$BIN_DIR/$command" ]; then status='installed'; else status='available'; fi
+        printf '%-25s %-10s %-12s %s\n' "$command" "$(script_type "$filename")" "$status" "scripts/$filename"
+    done
+}
+
+cmd_status() {
+    local branch upstream local_commit remote_commit
+    printf 'Repository:       %s\n' "$REPO_DIR"
+    printf 'CLI command:      %s\n' "$USER_BIN_DIR/dark-init"
+    printf 'Script directory: %s\n' "$BIN_DIR"
+    printf 'Virtualenv:       %s\n' "$VENV_DIR"
+    printf 'Update interval:  %s seconds\n' "$UPDATE_INTERVAL"
+    if [ -d "$REPO_DIR/.git" ]; then
+        branch="$(git -C "$REPO_DIR" branch --show-current 2>/dev/null || true)"
+        upstream="$(git -C "$REPO_DIR" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)"
+        local_commit="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+        printf 'Git branch:       %s\n' "${branch:-detached HEAD}"
+        printf 'Local commit:     %s\n' "${local_commit:-unknown}"
+        printf 'Git upstream:     %s\n' "${upstream:-not configured}"
+        if [ -n "$upstream" ]; then
+            remote_commit="$(git -C "$REPO_DIR" rev-parse --short "$upstream" 2>/dev/null || true)"
+            printf 'Fetched upstream: %s\n' "${remote_commit:-unknown}"
+        fi
+    else
+        printf 'Git repository:   no (.git not present)\n'
+    fi
+}
+
+is_check_due() {
+    local now last
+    [[ "$UPDATE_INTERVAL" =~ ^[0-9]+$ ]] || die "DARK_INIT_UPDATE_INTERVAL must be an integer"
+    [ ! -f "$CHECK_FILE" ] && return 0
+    now="$(date +%s)"
+    last="$(cat "$CHECK_FILE" 2>/dev/null || printf 0)"
+    [ $((now - last)) -ge "$UPDATE_INTERVAL" ]
+}
+
+cmd_update() {
+    local quiet=0 force=0 upstream local_commit remote_commit
+    while [ "$#" -gt 0 ]; do
+        case "$1" in --quiet) quiet=1 ;; --force) force=1 ;; *) die "Unknown update option: $1" ;; esac
+        shift
+    done
+    [ -d "$REPO_DIR/.git" ] || { [ "$quiet" -eq 1 ] || warn "Update unavailable: $REPO_DIR is not a Git checkout"; return 0; }
+    if [ "$force" -eq 0 ] && ! is_check_due; then return 0; fi
+    mkdir -p "$CACHE_DIR"
+    date +%s > "$CHECK_FILE"
+    if ! git -C "$REPO_DIR" diff --quiet || ! git -C "$REPO_DIR" diff --cached --quiet; then
+        [ "$quiet" -eq 1 ] || warn "Update skipped because the repository has local changes"
+        return 0
+    fi
+    upstream="$(git -C "$REPO_DIR" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)"
+    if [ -z "$upstream" ]; then [ "$quiet" -eq 1 ] || warn "Update skipped: current branch has no upstream"; return 0; fi
+    [ "$quiet" -eq 1 ] || info "Checking for dark-init updates"
+    if ! git -C "$REPO_DIR" fetch --quiet; then [ "$quiet" -eq 1 ] || warn "Could not fetch the Git remote"; return 0; fi
+    local_commit="$(git -C "$REPO_DIR" rev-parse HEAD)"
+    remote_commit="$(git -C "$REPO_DIR" rev-parse '@{upstream}')"
+    if [ "$local_commit" = "$remote_commit" ]; then [ "$quiet" -eq 1 ] || ok "dark-init is already up to date"; return 0; fi
+    if ! git -C "$REPO_DIR" merge-base --is-ancestor HEAD '@{upstream}'; then
+        [ "$quiet" -eq 1 ] || warn "Update skipped: local branch cannot be fast-forwarded"
+        return 0
+    fi
+    git -C "$REPO_DIR" merge --ff-only --quiet '@{upstream}'
+    "$REPO_DIR/dark-init" install
+    [ "$quiet" -eq 1 ] || ok "dark-init updated"
+}
+
+main() {
+    local command="${1:-help}"
+    [ "$#" -eq 0 ] || shift
+    case "$command" in
+        install) cmd_install "$@" ;;
+        list|ls) cmd_list "$@" ;;
+        status) cmd_status "$@" ;;
+        update) cmd_update "$@" ;;
+        help|-h|--help) usage ;;
+        *) die "Unknown command: $command. Run 'dark-init help'." ;;
+    esac
+}
+main "$@"
