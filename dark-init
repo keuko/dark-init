@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+REPO_DIR="$(cd -- "$(dirname -- "${SCRIPT_PATH}")" && pwd -P)"
 DATA_DIR="${DARK_INIT_DATA_DIR:-${HOME}/.local/share/dark-init}"
 BIN_DIR="${DATA_DIR}/bin"
 VENV_DIR="${DATA_DIR}/venv"
