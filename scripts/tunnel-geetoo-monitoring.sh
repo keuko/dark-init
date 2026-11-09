@@ -27,6 +27,7 @@ SERVICES=(
     "prometheus:9091"
     "alertmanager:9093"
     "haproxy-stats:1984"
+    "rabbitmq:15672"
 )
 CONTROL_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/monitoring-tunnel-${JUMP_USER}@${JUMP_HOST}.sock"
 HOSTS_FILE="/etc/hosts"
